@@ -119,7 +119,7 @@ def build_scratch_transformer(vocab_size):
 # ----------------------------------------------------------------------
 # Load & cache the vectorizer + model (heavy, so cached across reruns)
 # ----------------------------------------------------------------------
-@st.cache_resource(show_spinner="در حال بارگذاری مدل و واژگان...")
+@st.cache_resource(show_spinner="Loading model and vocabulary...")
 def load_artifacts():
     df = pd.read_csv(TRAIN_CSV_PATH)
     df = df[df["sentiment"].isin(CLASS_NAMES)].reset_index(drop=True)
@@ -135,7 +135,34 @@ def load_artifacts():
     vocab_size = len(vectorizer.get_vocabulary())
 
     model = build_scratch_transformer(vocab_size)
-    model.load_weights(str(MODEL_PATH))
+
+    # Two loading strategies, tried in order. Different TF/Keras versions
+    # (e.g. local machine vs. Streamlit Cloud) can disagree on how to read
+    # weights out of a native .keras archive, so we don't rely on only one.
+    load_errors = []
+    try:
+        # Strategy 1: load weights onto the architecture we just built.
+        model.load_weights(str(MODEL_PATH))
+    except Exception as e1:
+        load_errors.append(f"load_weights() failed: {e1!r}")
+        try:
+            # Strategy 2: load the full saved model directly (architecture
+            # + weights) and use it in place of our rebuilt one.
+            model = tf.keras.models.load_model(
+                str(MODEL_PATH),
+                custom_objects={
+                    "PositionalEmbedding": PositionalEmbedding,
+                    "TransformerEncoder": TransformerEncoder,
+                },
+                safe_mode=False,
+            )
+        except Exception as e2:
+            load_errors.append(f"load_model() fallback failed: {e2!r}")
+            raise RuntimeError(
+                "Could not load the model with either strategy:\n- "
+                + "\n- ".join(load_errors)
+                + f"\n\nTensorFlow version: {tf.__version__} / Keras version: {tf.keras.__version__}"
+            )
 
     return vectorizer, model, vocab_size, len(train_df)
 
@@ -207,53 +234,58 @@ st.markdown(
 try:
     vectorizer, model, vocab_size, n_train = load_artifacts()
     load_error = None
-except Exception as e:  # surfaced in the UI below instead of crashing silently
+except Exception:  # surfaced in the UI below instead of crashing silently
+    import traceback
+
     vectorizer = model = vocab_size = n_train = None
-    load_error = str(e)
+    load_error = traceback.format_exc()
 
 # ----------------------------------------------------------------------
 # Sidebar
 # ----------------------------------------------------------------------
 with st.sidebar:
-    st.markdown("### 🧠 درباره مدل")
+    st.markdown("### 🧠 About the Model")
     st.markdown(
         """
-        یک **Transformer** ساخته‌شده از پایه با Keras برای تحلیل احساس
-        توییت‌ها (مثبت / منفی).
+        A **Transformer** built from scratch with Keras for tweet
+        sentiment analysis (Positive / Negative).
         """
     )
     st.divider()
-    st.markdown("**معماری**")
+    st.markdown("**Architecture**")
     st.code(
-        f"""Seq Len:      {SEQ_LEN}
-Embed Dim:    {EMBED_DIM}
-Num Heads:    {NUM_HEADS}
-FFN Dim:      {FF_DIM}
-Vocab Size:   {vocab_size if vocab_size else "—"}
-Train Samples:{n_train if n_train else "—"}""",
+        f"""Seq Len:       {SEQ_LEN}
+Embed Dim:     {EMBED_DIM}
+Num Heads:     {NUM_HEADS}
+FFN Dim:       {FF_DIM}
+Vocab Size:    {vocab_size if vocab_size else "—"}
+Train Samples: {n_train if n_train else "—"}""",
         language="text",
     )
     st.divider()
-    st.markdown("**دیتاست**")
-    st.caption("Twitter Sentiment (Positive / Negative) — پیش‌پردازش‌شده")
+    st.markdown("**Dataset**")
+    st.caption("Twitter Sentiment (Positive / Negative) — preprocessed")
     st.divider()
     st.caption("Software by Officiall · Mahan Liaghatmand")
 
 # ----------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------
-st.title("💬 تحلیل احساس توییت")
-st.caption("متن یک توییت را وارد کن تا مدل مشخص کند مثبت است یا منفی.")
+st.title("💬 Twitter Sentiment Analyzer")
+st.caption("Enter a tweet's text and the model will tell you if it's positive or negative.")
 
 if load_error:
     st.error(
-        "بارگذاری مدل با خطا مواجه شد. مطمئن شو فایل‌های `model/model_scratch_sentiment.keras` "
-        "و `data/twitter_training_clean_binary.csv` کنار app.py قرار دارند و tensorflow نصب است.\n\n"
-        f"جزئیات خطا:\n```\n{load_error}\n```"
+        "Failed to load the model. This is usually caused by a "
+        "TensorFlow/Keras version mismatch between your local environment "
+        "and the deployment environment (e.g. Streamlit Cloud) — pin the "
+        "tensorflow version in requirements.txt (current environment: "
+        f"TF {tf.__version__} / Keras {tf.keras.__version__})."
     )
+    st.code(load_error, language="text")
     st.stop()
 
-tab_single, tab_batch = st.tabs(["🔎 تحلیل تکی", "📄 تحلیل دسته‌ای (CSV)"])
+tab_single, tab_batch = st.tabs(["🔎 Single Analysis", "📄 Batch Analysis (CSV)"])
 
 with tab_single:
     examples = [
@@ -264,22 +296,22 @@ with tab_single:
 
     cols = st.columns(len(examples))
     for i, ex in enumerate(examples):
-        if cols[i].button(f"نمونه {i + 1}", use_container_width=True, key=f"ex_{i}"):
+        if cols[i].button(f"Example {i + 1}", use_container_width=True, key=f"ex_{i}"):
             st.session_state["tweet_input"] = ex
 
     text = st.text_area(
-        "متن توییت",
+        "Tweet text",
         key="tweet_input",
         height=120,
-        placeholder="مثلاً: I can't stop playing this game, it's amazing!",
+        placeholder="e.g. I can't stop playing this game, it's amazing!",
     )
 
-    analyze = st.button("🚀 تحلیل کن", type="primary", use_container_width=True)
+    analyze = st.button("🚀 Analyze", type="primary", use_container_width=True)
 
     if analyze:
         clean = (text or "").strip()
         if not clean:
-            st.warning("یک متن وارد کن.")
+            st.warning("Please enter some text.")
         else:
             prob = float(predict([clean], vectorizer, model)[0])
             label = CLASS_NAMES[1] if prob > 0.5 else CLASS_NAMES[0]
@@ -291,38 +323,38 @@ with tab_single:
                 f"""
                 <div class="result-card {css_class}">
                     <div class="result-label">{emoji} {label}</div>
-                    <div class="result-sub">اطمینان مدل: {confidence * 100:.1f}%</div>
+                    <div class="result-sub">Model confidence: {confidence * 100:.1f}%</div>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
             st.progress(confidence)
-            st.caption(f"خروجی خام مدل (احتمال کلاس Positive): {prob:.4f}")
+            st.caption(f"Raw model output (probability of Positive class): {prob:.4f}")
 
 with tab_batch:
-    st.markdown("یک فایل CSV با ستون `text` آپلود کن تا برای همه ردیف‌ها احساس پیش‌بینی شود.")
-    up = st.file_uploader("فایل CSV", type=["csv"])
+    st.markdown("Upload a CSV file with a `text` column to predict sentiment for every row.")
+    up = st.file_uploader("CSV file", type=["csv"])
     if up is not None:
         try:
             batch_df = pd.read_csv(up)
         except Exception as e:
-            st.error(f"خواندن فایل ناموفق بود: {e}")
+            st.error(f"Failed to read the file: {e}")
             batch_df = None
 
         if batch_df is not None:
             if "text" not in batch_df.columns:
-                st.error("فایل باید ستونی به نام `text` داشته باشد.")
+                st.error("The file must have a column named `text`.")
             else:
-                if st.button("🚀 تحلیل دسته‌ای", type="primary"):
+                if st.button("🚀 Run Batch Analysis", type="primary"):
                     texts = batch_df["text"].astype(str).tolist()
-                    with st.spinner(f"در حال تحلیل {len(texts)} ردیف..."):
+                    with st.spinner(f"Analyzing {len(texts)} rows..."):
                         probs = predict(texts, vectorizer, model)
                     batch_df["sentiment"] = np.where(probs > 0.5, "Positive", "Negative")
                     batch_df["confidence"] = np.where(probs > 0.5, probs, 1 - probs).round(4)
-                    st.success("انجام شد.")
+                    st.success("Done.")
                     st.dataframe(batch_df, use_container_width=True)
                     st.download_button(
-                        "⬇️ دانلود نتایج (CSV)",
+                        "⬇️ Download Results (CSV)",
                         batch_df.to_csv(index=False).encode("utf-8"),
                         file_name="sentiment_results.csv",
                         mime="text/csv",
